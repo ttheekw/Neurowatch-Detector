@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# In a clean distribution container: install the nw-detect package, check it
+# can run the analysis and serve, then remove it.
+#
+#   docker run --rm -v "$PWD:/work:ro" ubuntu:22.04 bash /work/scripts/smoke_linux_package.sh deb
+set -euo pipefail
+FORMAT="${1:?usage: smoke_linux_package.sh deb|rpm|arch}"
+DIST="${DIST:-/work/dist/release}"
+
+package() {
+    # shellcheck disable=SC2206 # the pattern is meant to expand
+    local matches=("$DIST"/$1)
+    [[ ${#matches[@]} -eq 1 && -f "${matches[0]}" ]] \
+        || { echo "expected one $1 in $DIST, found: ${matches[*]}" >&2; exit 1; }
+    printf '%s\n' "${matches[0]}"
+}
+
+case "$FORMAT" in
+    deb)
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y "$(package 'nw-detect_*.deb')"
+        ;;
+    rpm) dnf install -y "$(package 'nw-detect-*.rpm')" ;;
+    arch) pacman -Syu --noconfirm; pacman -U --noconfirm "$(package 'nw-detect-*.pkg.tar.zst')" ;;
+    *) echo "unknown format: $FORMAT" >&2; exit 1 ;;
+esac
+
+nw-detect --version
+# Every element the analysis uses, from the bundled GStreamer only.
+nw-detect --check
+test -f /usr/lib/systemd/user/nw-detect.service
+test "$(readlink /usr/lib/systemd/user/default.target.wants/nw-detect.service)" = ../nw-detect.service
+
+work="$(mktemp -d)"
+daemon=""
+cleanup() {
+    if [[ -n "$daemon" ]]; then
+        kill "$daemon" 2>/dev/null || true
+        wait "$daemon" 2>/dev/null || true
+    fi
+    rm -rf "$work"
+}
+trap cleanup EXIT
+# The automatic service runs without transport arguments, in the user's session.
+XDG_RUNTIME_DIR="$work/runtime" XDG_STATE_HOME="$work/state" nw-detect > "$work/local.log" 2>&1 &
+daemon=$!
+for _ in $(seq 1 50); do
+    [[ -S "$work/runtime/neurowatch/plugins/nw-detect.sock" ]] && break
+    kill -0 "$daemon" 2>/dev/null || break
+    sleep 0.2
+done
+if [[ ! -S "$work/runtime/neurowatch/plugins/nw-detect.sock" ]]; then
+    cat "$work/local.log" >&2
+    exit 1
+fi
+[[ "$(stat -c %a "$work/runtime/neurowatch/plugins/nw-detect.sock")" == 600 ]]
+kill "$daemon"
+wait "$daemon" 2>/dev/null || true
+daemon=""
+nw-detect access-codes add "$work/codes.json" smoke --max-connections 1 >/dev/null
+nw-detect access-codes list "$work/codes.json" | grep -q '^smoke'
+grep -q '"hash"' "$work/codes.json"
+
+nw-detect --listen tcp:127.0.0.1:7699 --identity "$work/identity.key" \
+    --access-codes "$work/codes.json" > "$work/daemon.log" 2>&1 &
+daemon=$!
+for _ in $(seq 1 50); do
+    grep -q 'Listening for NeuroWatch' "$work/daemon.log" && break
+    kill -0 "$daemon" 2>/dev/null || break
+    sleep 0.2
+done
+if ! grep -q 'Listening for NeuroWatch' "$work/daemon.log"; then
+    cat "$work/daemon.log" >&2
+    exit 1
+fi
+kill "$daemon"
+wait "$daemon" 2>/dev/null || true
+daemon=""
+
+case "$FORMAT" in
+    deb) apt-get remove -y nw-detect ;;
+    rpm) dnf remove -y nw-detect ;;
+    arch) pacman -R --noconfirm nw-detect ;;
+esac
+if [[ -e /opt/nw-detect || -e /usr/bin/nw-detect || -e /usr/lib/systemd/user/nw-detect.service \
+    || -L /usr/lib/systemd/user/default.target.wants/nw-detect.service ]]; then
+    echo 'files left behind after removal' >&2
+    exit 1
+fi
+echo "nw-detect $FORMAT package: installed, checked, served and removed"
