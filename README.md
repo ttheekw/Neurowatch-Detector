@@ -77,6 +77,25 @@ that installed copy; upgrades preserve its identity.
 `nw-detect\bin\nw-detect.exe` on Windows. These are the manual option and do not install startup
 entries. `nw-detect --check` checks the bundled decoders.
 
+### Check a download
+
+`SHA256SUMS` lists every file of a release, and the release workflow signs it with
+[Sigstore cosign](https://docs.sigstore.dev/cosign/signing/overview/). No signing key is stored
+anywhere: the signature, certificate and transparency-log proof are in
+`SHA256SUMS.sigstore.json` beside it. Download both next to the package, then, with cosign 3
+or newer:
+
+```sh
+sha256sum -c SHA256SUMS --ignore-missing
+cosign verify-blob --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity-regexp '^https://github\.com/ttheekw/Neurowatch-Detector/\.github/workflows/release\.yml@refs/tags/v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  SHA256SUMS
+```
+
+The first command shows the file is the one the release lists; the second that the list was
+made by this repository's release workflow for a version tag.
+
 ### Local mode (default)
 
 The daemon listens locally by default and is found in NeuroWatch's **Plugins → Add Plugin →
@@ -262,15 +281,22 @@ Pushing `main` or opening a pull request runs source checks and tests. Downloada
 installers and Linux packages are built and published **only when a version tag is pushed**
 (for example, `v0.1.0`). Normal branch pushes do not produce downloadable packages.
 
+To try the packaging without releasing, run the workflow by hand: **Actions → Release → Run
+workflow**, choose the branch and, if you like, enter a version such as `v0.1.0-rc.1` (left
+empty, it is the one in `Cargo.toml`). It builds and checks every package exactly as a tag
+does and publishes nothing: the packages stay on the run's page as artifacts.
+
 The [Release workflow](.github/workflows/release.yml) builds the Windows installer/ZIP and Linux
 packages (x86_64 and arm64), installs each one in clean Ubuntu, Debian, Fedora and Arch
 containers, runs `--check`, serves with an access code, and only then publishes the GitHub
-Release with `SHA256SUMS` and the version-free names the download table links to. A tag with
-a suffix (`v0.2.0-rc.1`) is published as a pre-release. The pinned NeuroWatch revision is public;
+Release with a signed `SHA256SUMS` ([Check a download](#check-a-download)) and the version-free
+names the download table links to. A tag with a suffix (`v0.2.0-rc.1`) is published as a
+pre-release. The containers are pulled by digest (the `digest` beside each image in the
+workflow): refresh a tag and its digest together. The pinned NeuroWatch revision is public;
 no cross-repository token is required.
 
-The [Windows workflow](.github/workflows/windows.yml) is called only by the tagged release
-workflow. It checks installer startup at the default local pipe, the sign-in shortcut, identity preservation
+The [Windows workflow](.github/workflows/windows.yml) is called only by the release workflow
+(a tag or a manual run). It checks installer startup at the default local pipe, the sign-in shortcut, identity preservation
 on upgrade, and shutdown/shortcut removal on uninstall. Linux native packages include the
 automatically enabled user service; package smoke tests also check the default local socket.
 
