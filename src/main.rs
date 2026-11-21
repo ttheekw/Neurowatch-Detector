@@ -17,6 +17,9 @@ Usage: nw-detect [--listen ADDRESS] [--identity PATH] [--access-codes PATH] [--m
   --access-codes PATH   serve only recorders sending one of the codes in this
                         file, each to its limit (written by `access-codes`;
                         re-read every 2 s; default: every approved recorder)
+  --open                on a quic: or tls: address others can reach, serve
+                        every recorder that connects, without access codes
+                        (refused otherwise)
   --model PATH          a YOLOX ONNX model with a fixed square input to use
                         instead of the built-in YOLOX-Nano (e.g. YOLOX-Tiny
                         or YOLOX-S, more accurate and slower)
@@ -46,6 +49,7 @@ fn main() -> anyhow::Result<()> {
     let mut parent = None;
     let mut identity = None;
     let mut access = None;
+    let mut open = false;
     let mut model = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -84,6 +88,7 @@ fn main() -> anyhow::Result<()> {
                         .parse::<u32>()?,
                 )
             }
+            "--open" => open = true,
             "--check" => return check(model.as_deref()),
             "--version" => {
                 println!("nw-detect {}", env!("CARGO_PKG_VERSION"));
@@ -116,6 +121,16 @@ fn main() -> anyhow::Result<()> {
         watch_parent(parent)?;
     }
     let address = Address::parse(&listen.unwrap_or_else(default_address))?;
+    // A recorder needs nothing but this address to use the plugin: it proves
+    // only its own key. On an address others can reach that is everyone, so
+    // say so (vulnerability checklist R10).
+    if network_facing(&address) && !access.restricted() && !open {
+        anyhow::bail!(
+            "{address} can be reached from other machines, and without --access-codes every \
+             recorder that reaches it may use this plugin. Give --access-codes PATH (see \
+             `nw-detect access-codes add`), or --open to serve every recorder."
+        );
+    }
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         access_codes = access.restricted(),
@@ -407,4 +422,40 @@ fn access_codes(args: Vec<String>) -> anyhow::Result<()> {
         _ => anyhow::bail!("{ACCESS_USAGE}"),
     }
     Ok(())
+}
+
+/// A `quic:` or `tls:` address other machines can reach (not loopback; one
+/// that cannot be resolved counts as reachable).
+fn network_facing(address: &Address) -> bool {
+    use std::net::ToSocketAddrs;
+    match address {
+        Address::Quic { host, port } | Address::Tls { host, port } => (host.as_str(), *port)
+            .to_socket_addrs()
+            .map_or(true, |mut found| {
+                found.any(|socket| !socket.ip().is_loopback())
+            }),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod network_tests {
+    use super::*;
+
+    #[test]
+    fn only_quic_and_tls_beyond_loopback_face_the_network() {
+        for (address, facing) in [
+            ("quic:0.0.0.0:7690", true),
+            ("tls:0.0.0.0:7690", true),
+            ("quic:127.0.0.1:7690", false),
+            ("tls:[::1]:7690", false),
+            ("tcp:127.0.0.1:7690", false),
+        ] {
+            assert_eq!(
+                network_facing(&Address::parse(address).unwrap()),
+                facing,
+                "{address}"
+            );
+        }
+    }
 }

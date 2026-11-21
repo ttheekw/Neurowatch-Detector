@@ -21,9 +21,9 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          path: Neurowatch-Detect
+          path: Neurowatch-Detector
       # The Visual Studio developer environment for x64, as NeuroWatch's
       # release workflow sets it up: only the variables VsDevCmd changes.
       - name: Set up MSVC (x64)
@@ -90,14 +90,16 @@ jobs:
             }
             throw
           }
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
-          workspaces: Neurowatch-Detect
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: Neurowatch-Detector
           cache-on-failure: true
       - name: Build installer and portable zip
         shell: pwsh
-        working-directory: Neurowatch-Detect
+        working-directory: Neurowatch-Detector
         env:
           RELEASE_VERSION: ${{ inputs.version }}
         run: |
@@ -111,7 +113,7 @@ jobs:
       # Unzipped elsewhere, without GStreamer on PATH: serves with access codes.
       - name: Check the unzipped program serves
         shell: pwsh
-        working-directory: Neurowatch-Detect
+        working-directory: Neurowatch-Detector
         run: |
           $dir = Join-Path $env:RUNNER_TEMP 'portable'
           Expand-Archive (Get-Item dist/release/nw-detect-*-windows-x86_64.zip).FullName $dir
@@ -135,7 +137,7 @@ jobs:
           if (-not $listening) { Get-Content $log -ErrorAction SilentlyContinue; throw 'nw-detect did not start listening' }
       - name: Check automatic local startup, upgrade and uninstall
         shell: pwsh
-        working-directory: Neurowatch-Detect
+        working-directory: Neurowatch-Detector
         run: |
           try {
             ./scripts/smoke_windows_installer.ps1 -Installer (Get-Item dist/release/*-setup.exe).FullName
@@ -144,8 +146,8 @@ jobs:
             Write-Host "::error title=Windows installer test::$message"
             throw
           }
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: release-windows-x86_64
-          path: Neurowatch-Detect/dist/release/*
+          path: Neurowatch-Detector/dist/release/*
           if-no-files-found: error

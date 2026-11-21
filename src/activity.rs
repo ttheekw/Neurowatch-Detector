@@ -73,12 +73,12 @@ impl Activity {
             let (min_duration, cooldown) = (self.min_duration_ms, self.cooldown_ms);
             let track = &mut self.tracks[kind.index()];
             if seen.is_empty() {
-                if track.open && now_ms - track.last_seen_ms >= cooldown {
+                if track.open && now_ms.saturating_sub(track.last_seen_ms) >= cooldown {
                     actions.extend(finish(track, kind));
                 } else if !track.open
-                    && track
-                        .first_seen_ms
-                        .is_some_and(|_| now_ms - track.last_seen_ms > CANDIDATE_GAP_MS)
+                    && track.first_seen_ms.is_some_and(|_| {
+                        now_ms.saturating_sub(track.last_seen_ms) > CANDIDATE_GAP_MS
+                    })
                 {
                     *track = Track::default();
                 }
@@ -92,16 +92,16 @@ impl Activity {
                 let (x, y) = detection.foot();
                 track.zones.extend(settings.zones_at(x, y));
             }
-            if !track.open && now_ms - first >= min_duration {
+            if !track.open && now_ms.saturating_sub(first) >= min_duration {
                 track.open = true;
                 actions.push(Action::Start {
                     kind,
                     score: track.peak,
                 });
                 // The first update follows at once, with what was seen so far.
-                track.updated_ms = now_ms - UPDATE_INTERVAL_MS;
+                track.updated_ms = now_ms.saturating_sub(UPDATE_INTERVAL_MS);
             }
-            if track.open && now_ms - track.updated_ms >= UPDATE_INTERVAL_MS {
+            if track.open && now_ms.saturating_sub(track.updated_ms) >= UPDATE_INTERVAL_MS {
                 actions.push(update(track, kind));
                 track.updated_ms = now_ms;
             }
@@ -237,5 +237,14 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn extreme_timestamps_do_not_overflow() {
+        let settings = settings();
+        let mut activity = Activity::new(&settings);
+        activity.observe(&[person(0.6)], &settings, i64::MIN);
+        activity.observe(&[person(0.6)], &settings, i64::MAX);
+        activity.observe(&[], &settings, i64::MAX);
     }
 }
