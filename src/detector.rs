@@ -5,8 +5,11 @@
 //! ([`install`], [`shared`]). A picture goes in as RGB of any size; it is
 //! letterboxed to the model's square input as YOLOX was trained (top-left,
 //! grey 114 padding, BGR, 0–255), and the raw grid output is decoded and
-//! thinned with per-class non-maximum suppression.
-use crate::settings::{DetectSettings, Kind};
+//! thinned with per-class non-maximum suppression. What the model's classes are comes
+//! from its class file ([`ClassList`]).
+use crate::classes::ClassList;
+use crate::settings::DetectSettings;
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use tract_onnx::prelude::*;
 
@@ -26,34 +29,70 @@ pub struct Model {
     pub size: usize,
     /// Where it came from, for the logs and `--check`.
     pub name: String,
+    /// What its output columns mean.
+    pub classes: Arc<ClassList>,
 }
 
 static SHARED: OnceLock<Arc<Model>> = OnceLock::new();
 
 /// Load the model once for the whole process: the built-in one, or a YOLOX
-/// ONNX export at `path`.
-pub fn install(path: Option<&std::path::Path>) -> anyhow::Result<Arc<Model>> {
+/// ONNX export at `path` with its class file (`classes`, else `path` with
+/// the extension `.json`).
+pub fn install(
+    path: Option<&std::path::Path>,
+    classes: Option<&std::path::Path>,
+) -> anyhow::Result<Arc<Model>> {
+    if let Some(model) = SHARED.get() {
+        return Ok(Arc::clone(model));
+    }
+    // One load at a time: threads that arrive together share the first's.
+    static LOADING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _loading = LOADING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(model) = SHARED.get() {
         return Ok(Arc::clone(model));
     }
     let model = Arc::new(match path {
-        Some(path) => Model::load(&std::fs::read(path)?, path.display().to_string())?,
-        None => Model::load(BUILT_IN, "YOLOX-Nano (built in)".into())?,
+        Some(path) => {
+            let class_file = classes.map_or_else(|| crate::classes::beside(path), PathBuf::from);
+            let list = ClassList::load(&class_file)?;
+            Model::load(&std::fs::read(path)?, path.display().to_string(), list)?
+        }
+        None => {
+            let list = match classes {
+                Some(file) => ClassList::load(file)?,
+                None => {
+                    ClassList::built_in().map_err(|e| anyhow::anyhow!("built-in classes: {e}"))?
+                }
+            };
+            Model::load(BUILT_IN, "YOLOX-Nano (built in)".into(), list)?
+        }
     });
     Ok(Arc::clone(SHARED.get_or_init(|| model)))
 }
 
 /// The process's model, loading the built-in one if none was installed.
 pub fn shared() -> anyhow::Result<Arc<Model>> {
-    install(None)
+    install(None, None)
+}
+
+/// The process's classes (empty if the model cannot load).
+pub fn shared_classes() -> Arc<ClassList> {
+    shared().map_or_else(
+        |_| Arc::new(ClassList::default()),
+        |model| Arc::clone(&model.classes),
+    )
 }
 
 /// One object the detector found, in coordinates normalised to the picture.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Detection {
-    pub kind: Kind,
-    /// What the model called it (`car`, `dog`…).
-    pub class: &'static str,
+    /// The class's index in the model's output.
+    pub class: usize,
+    /// The class's id (`car`, `dog`…): the event kind.
+    pub id: Arc<str>,
+    pub label: Arc<str>,
     pub score: f32,
     /// `[x, y, width, height]`, 0..1.
     pub rect: [f32; 4],
@@ -69,31 +108,8 @@ impl Detection {
     }
 }
 
-/// COCO's classes this plugin reports, and as what.
-pub fn class(index: usize) -> Option<(Kind, &'static str)> {
-    Some(match index {
-        0 => (Kind::Person, "person"),
-        1 => (Kind::Vehicle, "bicycle"),
-        2 => (Kind::Vehicle, "car"),
-        3 => (Kind::Vehicle, "motorcycle"),
-        5 => (Kind::Vehicle, "bus"),
-        7 => (Kind::Vehicle, "truck"),
-        14 => (Kind::Animal, "bird"),
-        15 => (Kind::Animal, "cat"),
-        16 => (Kind::Animal, "dog"),
-        17 => (Kind::Animal, "horse"),
-        18 => (Kind::Animal, "sheep"),
-        19 => (Kind::Animal, "cow"),
-        20 => (Kind::Animal, "elephant"),
-        21 => (Kind::Animal, "bear"),
-        22 => (Kind::Animal, "zebra"),
-        23 => (Kind::Animal, "giraffe"),
-        _ => return None,
-    })
-}
-
 impl Model {
-    pub fn load(bytes: &[u8], name: String) -> anyhow::Result<Self> {
+    pub fn load(bytes: &[u8], name: String, classes: ClassList) -> anyhow::Result<Self> {
         let model = tract_onnx::onnx()
             .model_for_read(&mut std::io::Cursor::new(bytes))?
             .into_optimized()?;
@@ -108,12 +124,32 @@ impl Model {
                 "{name}: expected a YOLOX model with a fixed square input [1, 3, N, N], found {other:?}"
             ),
         };
+        // Output columns: x, y, w, h, objectness, then one score per class.
+        let columns = model
+            .output_fact(0)?
+            .shape
+            .as_concrete()
+            .filter(|shape| shape.len() == 3)
+            .map(|shape| shape[2]);
+        if let Some(columns) = columns {
+            anyhow::ensure!(
+                columns >= 5 && columns - 5 == classes.len(),
+                "{name}: the model has {} classes but its class file lists {}",
+                columns.saturating_sub(5),
+                classes.len()
+            );
+        }
         let plan = model.into_runnable()?;
-        Ok(Self { plan, size, name })
+        Ok(Self {
+            plan,
+            size,
+            name,
+            classes: Arc::new(classes),
+        })
     }
 
-    /// The objects in an RGB picture (`width × height`, rows packed), before
-    /// any setting is applied, above `min_score`.
+    /// Every class's objects in an RGB picture (`width × height`, rows
+    /// packed) above `min_score`.
     pub fn detect(
         &self,
         rgb: &[u8],
@@ -121,6 +157,26 @@ impl Model {
         height: usize,
         min_score: f32,
     ) -> anyhow::Result<Vec<Detection>> {
+        self.detect_classes(
+            rgb,
+            width,
+            height,
+            &vec![Some(min_score); self.classes.len()],
+        )
+    }
+
+    /// The objects of the classes with a threshold (`thresholds[i]` for class
+    /// `i`, `None`: not wanted), each at or above its own.
+    pub fn detect_classes(
+        &self,
+        rgb: &[u8],
+        width: usize,
+        height: usize,
+        thresholds: &[Option<f32>],
+    ) -> anyhow::Result<Vec<Detection>> {
+        let Some(lowest) = thresholds.iter().flatten().copied().reduce(f32::min) else {
+            return Ok(vec![]);
+        };
         anyhow::ensure!(
             width > 0 && height > 0 && rgb.len() >= width * height * 3,
             "picture of {width}×{height} has {} bytes",
@@ -134,8 +190,9 @@ impl Model {
         let rows = shape.get(1).copied().unwrap_or(0);
         let columns = shape.get(2).copied().unwrap_or(0);
         anyhow::ensure!(
-            shape.len() == 3 && columns > 5 && rows == anchors(self.size),
-            "unexpected output shape {shape:?}"
+            shape.len() == 3 && columns == 5 + self.classes.len() && rows == anchors(self.size),
+            "unexpected output shape {shape:?} for {} classes",
+            self.classes.len()
         );
         let data = output
             .as_slice()
@@ -144,22 +201,25 @@ impl Model {
         for (row, (grid_x, grid_y, stride)) in grid(self.size).enumerate() {
             let values = &data[row * columns..(row + 1) * columns];
             let objectness = values[4];
-            if objectness < min_score {
+            if objectness < lowest {
                 continue;
             }
-            let Some((best, class_score)) = values[5..]
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| class(*index).is_some())
-                .max_by(|a, b| a.1.total_cmp(b.1))
-            else {
+            let mut best: Option<(usize, f32)> = None;
+            for (index, class_score) in values[5..].iter().enumerate() {
+                let score = objectness * class_score;
+                let wanted = thresholds
+                    .get(index)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|threshold| score >= threshold);
+                if wanted && best.is_none_or(|(_, top)| score > top) {
+                    best = Some((index, score));
+                }
+            }
+            let Some((class, score)) = best else {
                 continue;
             };
-            let score = objectness * class_score;
-            if score < min_score {
-                continue;
-            }
-            let Some((kind, name)) = class(best) else {
+            let Some(info) = self.classes.get(class) else {
                 continue;
             };
             let stride = stride as f32;
@@ -174,31 +234,36 @@ impl Model {
                 h / height as f32,
             );
             if rect[2] > 0.0 && rect[3] > 0.0 {
-                candidates.push((
-                    kind.index(),
-                    Detection {
-                        kind,
-                        class: name,
-                        score,
-                        rect,
-                    },
-                ));
+                candidates.push(Detection {
+                    class,
+                    id: Arc::clone(&info.id),
+                    label: Arc::clone(&info.label),
+                    score,
+                    rect,
+                });
             }
         }
         Ok(suppress(candidates))
     }
 }
 
-/// The detections a camera's settings keep: chosen kinds, confident enough,
-/// standing in a watched place.
+/// The detections a camera's settings keep: chosen classes, each confident
+/// enough for its own setting, standing in a watched place.
+/// The sightings worth tracking: a chosen class at or above its confidence,
+/// with an allowed size and shape, not standing in an ignored area. Whether
+/// a watched area is needed is decided per object, later (`crate::objects`):
+/// an object outside one is still followed and drawn.
 pub fn keep(detections: Vec<Detection>, settings: &DetectSettings) -> Vec<Detection> {
-    let min = f32::from(settings.confidence) / 100.0;
     detections
         .into_iter()
-        .filter(|d| d.score >= min && settings.wants(d.kind))
+        .filter(|d| {
+            settings.class(&d.id).is_some_and(|choice| {
+                d.score >= f32::from(choice.confidence) / 100.0 && choice.fits(d.rect)
+            })
+        })
         .filter(|d| {
             let (x, y) = d.foot();
-            settings.watched(x, y)
+            !settings.ignored(x, y)
         })
         .collect()
 }
@@ -260,25 +325,23 @@ fn iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {
     }
 }
 
-/// Non-maximum suppression within each kind: one box per object, even when
-/// the model is torn between `car` and `truck`.
-fn suppress(mut candidates: Vec<(usize, Detection)>) -> Vec<Detection> {
-    candidates.sort_by(|a, b| b.1.score.total_cmp(&a.1.score));
+/// Non-maximum suppression within each class: one box per object of a class.
+fn suppress(mut candidates: Vec<Detection>) -> Vec<Detection> {
+    candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
     candidates.truncate(MAX_CANDIDATES);
-    let mut kept: Vec<(usize, Detection)> = Vec::new();
-    for (group, detection) in candidates {
-        if kept
-            .iter()
-            .all(|(other, kept)| *other != group || iou(&kept.rect, &detection.rect) < NMS_IOU)
-        {
-            kept.push((group, detection));
+    let mut kept: Vec<Detection> = Vec::new();
+    for detection in candidates {
+        if kept.iter().all(|other| {
+            other.class != detection.class || iou(&other.rect, &detection.rect) < NMS_IOU
+        }) {
+            kept.push(detection);
         }
     }
-    kept.into_iter().map(|(_, detection)| detection).collect()
+    kept
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -300,56 +363,135 @@ mod tests {
         assert_eq!(input[40 * 64], PAD, "below the picture");
     }
 
-    #[test]
-    fn overlapping_boxes_of_one_kind_keep_the_surest() {
-        let detection = |score: f32, x: f32| Detection {
-            kind: Kind::Person,
-            class: "person",
+    pub(crate) fn found(class: usize, id: &str, score: f32, rect: [f32; 4]) -> Detection {
+        Detection {
+            class,
+            id: Arc::from(id),
+            label: Arc::from(id),
             score,
-            rect: [x, 0.1, 0.2, 0.5],
-        };
+            rect,
+        }
+    }
+
+    #[test]
+    fn overlapping_boxes_of_one_class_keep_the_surest() {
+        let detection =
+            |class: usize, score: f32, x: f32| found(class, "c", score, [x, 0.1, 0.2, 0.5]);
         let kept = suppress(vec![
-            (0, detection(0.6, 0.11)),
-            (0, detection(0.9, 0.1)),
-            (0, detection(0.8, 0.6)),
-            (2, detection(0.7, 0.1)),
+            detection(0, 0.6, 0.11),
+            detection(0, 0.9, 0.1),
+            detection(0, 0.8, 0.6),
+            detection(2, 0.7, 0.1),
         ]);
         let scores: Vec<f32> = kept.iter().map(|d| d.score).collect();
         assert_eq!(scores, vec![0.9, 0.8, 0.7]);
     }
 
     #[test]
-    fn settings_keep_only_chosen_confident_objects_in_watched_places() {
+    fn settings_keep_only_chosen_classes_at_their_own_confidence() {
+        let rect = [0.1, 0.1, 0.1, 0.3];
         let found = vec![
-            Detection {
-                kind: Kind::Person,
-                class: "person",
-                score: 0.8,
-                rect: [0.1, 0.1, 0.1, 0.3],
-            },
-            Detection {
-                kind: Kind::Person,
-                class: "person",
-                score: 0.3,
-                rect: [0.1, 0.1, 0.1, 0.3],
-            },
-            Detection {
-                kind: Kind::Animal,
-                class: "dog",
-                score: 0.9,
-                rect: [0.5, 0.5, 0.1, 0.1],
-            },
+            found(0, "person", 0.8, rect),
+            found(0, "person", 0.3, rect),
+            found(16, "dog", 0.9, rect),
+            found(2, "car", 0.6, rect),
         ];
-        let kept = keep(found, &DetectSettings::default());
+        let settings = DetectSettings {
+            classes: vec![
+                crate::settings::ClassChoice::new("person", 50),
+                crate::settings::ClassChoice::new("car", 70),
+            ],
+            ..DetectSettings::default()
+        };
+        let kept = keep(found, &settings);
         assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].class, "person");
+        assert_eq!(&*kept[0].id, "person");
+    }
+
+    #[test]
+    fn a_class_keeps_only_boxes_of_its_size_and_shape() {
+        let person = crate::settings::ClassChoice {
+            min_size: 1.0,
+            max_size: 20.0,
+            min_ratio: 0.2,
+            max_ratio: 1.0,
+            ..crate::settings::ClassChoice::new("person", 50)
+        };
+        let settings = DetectSettings {
+            classes: vec![person],
+            ..DetectSettings::default()
+        };
+        let kept =
+            |rect: [f32; 4]| !keep(vec![found(0, "person", 0.9, rect)], &settings).is_empty();
+        assert!(
+            kept([0.1, 0.1, 0.1, 0.3]),
+            "3% of the picture, 0.33 wide per high"
+        );
+        assert!(!kept([0.1, 0.1, 0.05, 0.1]), "0.5%: too small");
+        assert!(!kept([0.0, 0.0, 0.5, 0.6]), "30%: too large");
+        assert!(!kept([0.1, 0.1, 0.3, 0.1]), "3 wide per high: too wide");
+        assert!(
+            !kept([0.1, 0.1, 0.02, 0.5]),
+            "0.04 wide per high: too narrow"
+        );
+    }
+
+    #[test]
+    fn an_object_outside_the_watched_areas_is_kept_but_not_in_an_ignored_one() {
+        let square = |x0: f32, x1: f32| vec![[x0, 0.0], [x1, 0.0], [x1, 1.0], [x0, 1.0]];
+        let zone = |id: &str, kind, points| crate::settings::Zone {
+            id: id.into(),
+            name: String::new(),
+            kind,
+            points,
+            classes: vec![],
+            frames: 3,
+            loiter_sec: 0.0,
+            min_speed_kmh: 0.0,
+            sides_m: [0.0; 4],
+            events: true,
+            alerts: true,
+        };
+        let settings = DetectSettings {
+            classes: vec![crate::settings::ClassChoice::new("person", 50)],
+            zones: vec![
+                zone("road", crate::settings::ZoneKind::Include, square(0.0, 0.5)),
+                zone("tree", crate::settings::ZoneKind::Exclude, square(0.8, 1.0)),
+            ],
+            ..DetectSettings::default()
+        };
+        let at = |x: f32| found(0, "person", 0.9, [x, 0.2, 0.05, 0.3]);
+        let kept = keep(vec![at(0.1), at(0.6), at(0.9)], &settings);
+        let xs: Vec<f32> = kept.iter().map(|d| d.rect[0]).collect();
+        assert_eq!(
+            xs,
+            vec![0.1, 0.6],
+            "outside the watched area: still followed"
+        );
+    }
+
+    #[test]
+    fn a_class_file_that_does_not_match_the_model_is_refused() {
+        let classes = ClassList::parse(
+            r#"{"name": "T", "classes": [{"id": "a", "label": "A"}, {"id": "b", "label": "B"}]}"#,
+        )
+        .unwrap();
+        let error = Model::load(BUILT_IN, "m".into(), classes)
+            .err()
+            .map(|e| e.to_string());
+        assert!(error.is_some_and(|e| e.contains("80 classes")), "refused");
     }
 
     #[test]
     fn the_built_in_model_loads_and_finds_nothing_in_a_grey_picture() {
         let model = shared().unwrap();
         assert_eq!(model.size, 416);
+        assert_eq!(model.classes.len(), 80);
         let grey = vec![128u8; 640 * 360 * 3];
         assert!(model.detect(&grey, 640, 360, 0.5).unwrap().is_empty());
+        assert!(model
+            .detect_classes(&grey, 640, 360, &vec![None; 80])
+            .unwrap()
+            .is_empty());
     }
 }

@@ -4,9 +4,10 @@
 [![Release](https://github.com/ttheekw/Neurowatch-Detector/actions/workflows/release.yml/badge.svg)](https://github.com/ttheekw/Neurowatch-Detector/releases/latest)
 
 The object detection plugin for [NeuroWatch](https://github.com/ttheekw/Neurowatch): it finds
-**people, vehicles and animals** in your cameras' video and reports each as a NeuroWatch event,
-with a box around each one on the live wall and a count of what is in view. Events work like any
-other: the Events tab, alerts, event-based recording, and Home Assistant through NeuroWatch's
+the objects its model knows (the built-in model's 80 everyday classes: people, cars, dogs, bags and
+more) in your cameras' video, and you choose which to report. Each object it finds of a class
+you choose is its own NeuroWatch event, with a labelled box around each object on the live wall.
+Events work like any other: the Events tab, alerts, event-based recording, and Home Assistant through NeuroWatch's
 MQTT settings.
 
 NeuroWatch sends it the cameras' compressed H.264/H.265 video (or pictures the recorder already
@@ -169,8 +170,21 @@ setting (Automatic, VA-API, NVIDIA NVDEC, Intel Quick Sync, V4L2 or CPU; Direct3
 names the decoder used. Automatic tries VA-API, NVDEC, Direct3D 11, then V4L2, as NeuroWatch
 does; a choice that cannot be used, or a hardware decoder with no picture after 10 s, moves on
 and ends on the CPU, with the reason in the camera's status. VA-API is refused on GStreamer
-1.24.0–1.24.5 (it leaks). `--hardware-decoding` is ignored. `--check` lists the hardware decoders
-found. Preserve the identity file across restarts. Unix
+1.24.0–1.24.5 (it leaks). A hardware decoder that worked but fails twice within 10 minutes (an error
+from the decoder itself, or no picture for 10 s while video arrives) is given up the same way; a
+stream restart or format change never counts against it. `--hardware-decoding` is ignored.
+**Scaling on the GPU:** a hardware decoder's picture is shrunk to the analysis size while it is
+still in GPU memory, and only the small picture is downloaded (VA-API: `vapostproc`; NVDEC:
+`cudaconvertscale` + `cudadownload`; Direct3D 11 / 12: `d3d11convert` / `d3d12convert` + the matching
+`…download`). Quick Sync, V4L2 and the older `vaapi*`/`msdk*` decoders, the CPU decoder and the
+pictures NeuroWatch already decoded (in system memory) scale on the CPU. The GPU scaler is optional
+and per camera: one that is not installed is never used, a video that is not larger than the
+analysis size is not sent through it, and one that fails to start, gives no picture in 10 s or keeps
+failing is dropped for that camera (until its Video decoder setting changes) while the same
+decoder carries on with CPU scaling. The camera's status says who decoded and who scaled, for
+example `VA-API (Intel, AMD) · scaled down on the GPU` or `CPU (software) · scaled down on the CPU`,
+with the reason (for example "Scaling on the CPU: vapostproc could not scale this video") in its
+detail. `--check` lists the hardware decoders and the GPU scalers found. Preserve the identity file across restarts. Unix
 socket directories are private (0700), sockets and secret files owner-only (0600); Windows uses
 local named pipes and DPAPI-protected keys. QUIC binds its TLS certificate to the same plugin key.
 The host must approve that key and permissions before sending media or credentials.
@@ -226,18 +240,47 @@ Bind a camera in **Plugins** (NeuroWatch or the web portal), then set, per camer
 
 | Setting | Default | What it does |
 |---|---|---|
-| Report | People, Vehicles | Which of people, vehicles (bicycle, car, motorcycle, bus, truck) and animals (bird, cat, dog, horse, sheep, cow and others) to look for |
-| Confidence | 40% | How sure the model must be. Higher: fewer false alarms, small or distant objects missed |
-| Minimum duration | 1 s | Something seen for less is not reported |
-| Ends after | 10 s | An event ends once nothing of its kind has been seen this long |
+| Detect | Person, Car | Which of the model's classes to look for. Per class: **Confidence** (10–95%, starting at 50%: a single sighting below it is ignored), **Confirmed at** (70%: see below), smallest and largest box (% of the picture) and narrowest and widest box (width ÷ height) |
+| Alerts for | Person, Car | Events of these classes are alerts; the others are detections, recorded and listed but never sending alerts |
+| Minimum duration | 1 s | An object counting for less is not reported |
+| Ends after | 10 s | An object's event ends once it has not counted this long |
+| Stationary after | 10 s | An object that has not moved this long no longer starts or keeps an event (0: never) |
 | Pictures analysed per second | 2 | More catches quick visits and uses more processor |
 | Keyframes only (low CPU) | off | About one picture every one or two seconds |
 | Video decoder | Automatic | Hardware decoders first, falling back to the CPU |
-| Watched areas | whole picture | Include and ignore zones; an object counts where it stands (the bottom of its box) |
+| Watched areas | whole picture | Watched and ignored areas; an object is where it stands (the middle of its box's bottom edge). Per watched area: which classes it applies to, pictures in a row (3), loitering time, minimum speed (with the real side lengths of a 4-corner area on the ground), and whether events and alerts need it |
 
-Each kind is its own event (`person`, `vehicle`, `animal`): one event lasts while any of that kind
-is in view. Drawings: `objects` (a labelled box per object, on by default) and `zones`. Figures
-beside the picture count what is in view now.
+**How an object becomes an event.** Detect follows each object from picture to picture and
+decides on each:
+
+1. **Confirmed:** the middle of its recent scores (missing scores count as zero until there are
+   three) has reached its class's *Confirmed at*. One lucky sighting does not start an event,
+   and one weak sighting does not end one.
+2. **In a watched area:** it has stood in the area for the area's *pictures in a row*, for its
+   *loitering time*, at least at its *minimum speed*, and the area applies to its class.
+3. **Raises an event:** with any area marked *Events need this area*, only after it has been in
+   one of them (it still counts after leaving). Objects outside are still followed and drawn,
+   greyed.
+4. **Alert or detection:** an alert when its class is in *Alerts for* and, with any area marked
+   *Alerts need this area*, it has been in one of them; otherwise a detection. A detection
+   becomes an alert when such an object comes. NeuroWatch's alert rules fire on alerts only.
+5. **Stationary:** after *Stationary after* without moving, it no longer starts or keeps an event,
+   and counts again once it moves. In an area with a loitering time a person keeps its event
+   while there; anything else only until that time has passed. So a parked car ends its event;
+   an area drawn where cars pass, not where they park, keeps parked cars out altogether.
+
+Each object is its own event, of its class (its id, such as `person`, `car` or
+`traffic_light`): three cars passing one after another are three events, even when the next comes
+before the last has gone. The event lasts while its object counts; an object lost for a moment and
+found again where it was, before its event ended, keeps its event. There are no counts. Drawings: `objects` (a box per followed
+object labelled with its class and confidence, such as `Car 87%`, in its class colour while it
+counts and grey while it does not, `· still` when stationary; on by default) and `zones`.
+
+**Classes come from the model.** NeuroWatch learns the class list from the plugin, so another
+model brings its own classes with a class file beside it; see [models/README.md](models/README.md).
+Bindings saved by v0.1.1 (Report: people, vehicles, animals, one confidence) are converted on
+load: vehicles become bicycle, car, motorcycle, bus and truck, animals bird, cat, dog, horse,
+sheep, cow, elephant, bear, zebra and giraffe, each at the old confidence.
 
 **Speed.** On the development PC (a laptop CPU) one picture takes about 40 ms with the built-in
 YOLOX-Nano, so two pictures a second per camera use under a tenth of one core. This is a single
@@ -254,7 +297,7 @@ or use zones where it reports things that are not there.
 `nw-analytics-protocol` and `nw-analytics-sdk` are included library snapshots with explicit
 dependencies; see [`vendor/README.md`](vendor/README.md) for their origin and update procedure.
 `src/detector.rs` loads the model and turns pictures into detections, `activity.rs` turns
-detections into events, `drawing.rs` the boxes and counts, `worker.rs` owns decoding and shared
+detections into events, `classes.rs` the model's class file, `drawing.rs` the boxes, `worker.rs` owns decoding and shared
 pictures, `server.rs` the authenticated protocol. This repository started as a copy of
 [NeuroWatch Motion](https://github.com/ttheekw/Neurowatch-Motion), whose transport, decoding and
 packaging it shares.
@@ -275,14 +318,14 @@ cargo run --release --example detect_image -- /path/to/picture.jpg
 1. Set the new version in `Cargo.toml` and run `cargo build` (updates `Cargo.lock`).
 2. Pin `neurowatch.ref` to a public NeuroWatch commit containing the GStreamer build
    (`scripts/build_release_gstreamer.sh`). Analytics libraries come from this repo's `vendor/`.
-3. Push, wait for CI, then tag: `git tag v0.1.1 && git push origin v0.1.1`.
+3. Push, wait for CI, then tag: `git tag v0.2.0 && git push origin v0.2.0`.
 
 Pushing `main` or opening a pull request runs source checks and tests. Downloadable executables,
 installers and Linux packages are built and published **only when a version tag is pushed**
-(for example, `v0.1.1`). Normal branch pushes do not produce downloadable packages.
+(for example, `v0.2.0`). Normal branch pushes do not produce downloadable packages.
 
 To try the packaging without releasing, run the workflow by hand: **Actions → Release → Run
-workflow**, choose the branch and, if you like, enter a version such as `v0.1.1-rc.1` (left
+workflow**, choose the branch and, if you like, enter a version such as `v0.2.0-rc.1` (left
 empty, it is the one in `Cargo.toml`). It builds and checks every package exactly as a tag
 does and publishes nothing: the packages stay on the run's page as artifacts.
 
@@ -300,8 +343,8 @@ The [Windows workflow](.github/workflows/windows.yml) is called only by the rele
 on upgrade, and shutdown/shortcut removal on uninstall. Linux native packages include the
 automatically enabled user service; package smoke tests also check the default local socket.
 
-Locally: `scripts/package_linux.sh --version v0.1.1 --arch x86_64 --format portable,deb`
+Locally: `scripts/package_linux.sh --version v0.2.0 --arch x86_64 --format portable,deb`
 (builds NeuroWatch's GStreamer once into `build/gstreamer-sdk`; use a sibling checkout at the
 commit in `neurowatch.ref`, or set `NEUROWATCH_DIR`), and on Windows, from an MSVC
 developer shell with GStreamer's MSVC packages and Inno Setup 6,
-`scripts/package_windows.ps1 -Version v0.1.1` (use `-InnoSetupCompiler` for a custom compiler path).
+`scripts/package_windows.ps1 -Version v0.2.0` (use `-InnoSetupCompiler` for a custom compiler path).

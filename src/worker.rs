@@ -1,20 +1,21 @@
 //! One bound camera: compressed units in, object events out. Decodes the
 //! camera's units itself (or takes NeuroWatch's decoded pictures) into RGB
 //! [`ANALYSIS_WIDTH`] wide at the camera's analysis rate, runs the model and
-//! reports people, vehicles and animals.
+//! reports the classes its settings choose.
 use crate::activity::{Action, Activity};
-use crate::decoding;
+use crate::decoding::{self, RunningFailures};
 use crate::detector::{self, Model};
 use crate::drawing;
 use crate::manifest::{OBJECTS, ZONES};
+use crate::objects::Objects;
+use crate::scaling::{self, GpuScale, Scaler};
 use crate::settings::DetectSettings;
 use gstreamer::prelude::*;
 use gstreamer_video::prelude::*;
 use nw_analytics_protocol::{
     frame::MediaUnit,
     messages::{
-        BindingState, BindingStatus, Codec, EventEnd, EventStart, EventUpdate, Figure, Overlay,
-        OverlayItem, Status, StreamFormat,
+        BindingState, BindingStatus, Codec, EventEnd, Overlay, OverlayItem, Status, StreamFormat,
     },
     method,
     rpc::Message,
@@ -47,6 +48,33 @@ const RETRY_AFTER: Duration = Duration::from_secs(3);
 /// A hardware decoder with no picture to show for itself after this long has
 /// failed, whatever it says: the next one takes over.
 const DECODER_TRIAL: Duration = Duration::from_secs(10);
+/// A running hardware decoder (or its scaler) that has given no picture for
+/// this long while units arrive has stalled.
+const DECODER_STALL: Duration = Duration::from_secs(10);
+
+/// Which part of the decoding a failure is the fault of; only the decoder's
+/// own and the scaler's count against them (a stream restart or a format
+/// change never does).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cause {
+    Decoder,
+    Scaler,
+    Input,
+}
+
+impl Cause {
+    /// From the path of the element that posted an error: the elements the
+    /// pipelines name `scale`, `download` and `decode`.
+    fn of_source(path: &str) -> Self {
+        if path.contains(":scale") || path.contains(":download") {
+            Self::Scaler
+        } else if path.contains(":decode") {
+            Self::Decoder
+        } else {
+            Self::Input
+        }
+    }
+}
 
 /// Sends JSON-RPC messages to NeuroWatch (shared by a session's workers).
 pub trait Sender: Send + Sync + 'static {
@@ -160,6 +188,8 @@ struct Decoder {
     identities: std::sync::Mutex<BTreeMap<u64, PictureIdentity>>,
 }
 
+/// The size the GPU scales to: this wide, the stream's own shape.
+const TARGET: (u32, Option<u32>) = (ANALYSIS_WIDTH as u32, None);
 /// How far behind schedule a picture's timestamp means a new timeline.
 const TIMELINE_JUMP_NS: u64 = 2_000_000_000;
 
@@ -249,17 +279,30 @@ pub fn hardware_decoders() -> Vec<&'static str> {
     .collect()
 }
 
+/// The GPU scalers GStreamer has here, for `--check` (they are optional:
+/// without one the CPU scales).
+pub fn gpu_scalers() -> Vec<&'static str> {
+    scaling::available(&|name| gstreamer::ElementFactory::find(name).is_some())
+}
+
 impl Decoder {
     /// `element`: the decoder [`decoding::pick`] chose, named outright.
-    fn new(format: &StreamFormat, element: &str, fps: u8) -> anyhow::Result<Self> {
+    fn new(
+        format: &StreamFormat,
+        element: &str,
+        fps: u8,
+        gpu: Option<GpuScale>,
+    ) -> anyhow::Result<Self> {
         let (caps, parser) = match format.codec {
             Codec::H264 => ("video/x-h264", "h264parse"),
             Codec::H265 => ("video/x-h265", "h265parse"),
         };
+        // Scaled on the GPU before the download; `videoscale` then has nothing to do.
+        let gpu = gpu.map_or(String::new(), |gpu| format!("! {} ", gpu.segment()));
         let description = format!(
             "appsrc name=src is-live=true format=time \
                caps=\"{caps},stream-format=byte-stream,alignment=au\" \
-             ! {parser} ! {element} name=decode \
+             ! {parser} ! {element} name=decode {gpu}\
              ! videoscale ! videoconvert \
              ! video/x-raw,format=RGB,width={ANALYSIS_WIDTH},pixel-aspect-ratio=1/1 \
              ! appsink name=sink max-buffers=1 drop=true sync=false emit-signals=false"
@@ -467,12 +510,18 @@ impl Decoder {
         )))
     }
 
-    fn failed(&self) -> Option<String> {
+    /// What the pipeline reports gone wrong, and whose fault it was.
+    fn failed(&self) -> Option<(String, Cause)> {
         self.bus
             .pop_filtered(&[gstreamer::MessageType::Error, gstreamer::MessageType::Eos])
             .map(|message| match message.view() {
-                gstreamer::MessageView::Error(error) => error.error().to_string(),
-                _ => "the decoder stopped".into(),
+                gstreamer::MessageView::Error(error) => (
+                    error.error().to_string(),
+                    message
+                        .src()
+                        .map_or(Cause::Input, |src| Cause::of_source(&src.path_string())),
+                ),
+                _ => ("the decoder stopped".into(), Cause::Decoder),
             })
     }
 }
@@ -500,17 +549,31 @@ struct Run {
     /// The hardware decoder on trial: since when, until its first picture.
     decoder_trial: Option<Instant>,
     current_decoder: Option<&'static str>,
+    /// Whether the current decoder is a hardware one.
+    current_hardware: bool,
+    /// The GPU scaler the current decoder runs with (its trial is the decoder's).
+    current_scaler: Option<Scaler>,
+    /// GPU scalers that let this camera down: its decoder scales on the CPU.
+    failed_scalers: Vec<Scaler>,
+    /// Why this camera scales on the CPU although it might not have to.
+    scaler_note: Option<String>,
+    /// Failures of components that had produced pictures.
+    running_failures: RunningFailures,
+    /// The decoder given up for failing while running, for the note.
+    gave_up: Option<&'static str>,
+    /// When the current decoder last gave a picture (or started).
+    last_picture: Instant,
     /// Arrival time of the first unit of this decoder's run.
     base_us: i64,
     waiting_keyframe: bool,
     retry_at: Option<Instant>,
     moving: bool,
     model: Arc<Model>,
+    /// The objects followed over pictures, and the rules on them.
+    objects: Objects,
     activity: Activity,
-    /// Each kind's open event number.
-    event: [Option<u64>; 3],
-    /// What is in view now, for the status.
-    figures: Vec<Figure>,
+    /// Each open event's protocol number, by its number in `activity`.
+    event: BTreeMap<u64, u64>,
     /// Layers that show something now (cleared when that ends).
     drawn: [bool; 2],
     last_ms: Option<i64>,
@@ -535,7 +598,7 @@ impl Run {
         Self {
             binding,
             activity: Activity::new(&settings),
-            figures: drawing::figures(&[], &settings),
+            objects: Objects::new(),
             model,
             settings,
             events,
@@ -549,11 +612,18 @@ impl Run {
             decoder_note: None,
             decoder_trial: None,
             current_decoder: None,
+            current_hardware: false,
+            current_scaler: None,
+            failed_scalers: vec![],
+            scaler_note: None,
+            running_failures: RunningFailures::default(),
+            gave_up: None,
+            last_picture: now,
             base_us: 0,
             waiting_keyframe: true,
             retry_at: None,
             moving: false,
-            event: [None; 3],
+            event: BTreeMap::new(),
             drawn: [false; 2],
             last_ms: None,
             state: BindingState::Waiting,
@@ -630,9 +700,14 @@ impl Run {
                 }
                 if decoder_changed {
                     self.failed_decoders.clear();
+                    self.failed_scalers.clear();
+                    self.running_failures.clear();
+                    self.gave_up = None;
                     self.decoder_note = None;
+                    self.scaler_note = None;
                     self.decoder_trial = None;
                     self.current_decoder = None;
+                    self.current_scaler = None;
                     self.retry_at = None;
                     // Desktop pictures need no decoder of this camera's own.
                     if self.raw_layout.is_none() {
@@ -656,7 +731,7 @@ impl Run {
                             self.raw_layout = Some(layout);
                         }
                         Err(error) => {
-                            self.fail(error.to_string());
+                            self.fail(error.to_string(), Cause::Input);
                             self.pictures.withdraw();
                             return;
                         }
@@ -667,7 +742,7 @@ impl Run {
                     .as_ref()
                     .map(|decoder| decoder.push_raw(picture))
                 {
-                    self.fail(error.to_string());
+                    self.fail(error.to_string(), Cause::Input);
                     self.pictures.withdraw();
                 }
             }
@@ -688,6 +763,8 @@ impl Run {
         // A decoder on trial starts its trial again with the next one.
         self.decoder_trial = None;
         self.current_decoder = None;
+        self.current_hardware = false;
+        self.current_scaler = None;
         self.raw_layout = None;
         self.picture_seq = None;
         self.waiting_keyframe = true;
@@ -696,10 +773,10 @@ impl Run {
 
     fn reset_detection(&mut self) {
         self.finish_activity();
-        self.draw(OBJECTS, vec![]);
-        self.draw(ZONES, vec![]);
+        self.clear_layer(OBJECTS);
+        self.clear_layer(ZONES);
         self.activity = Activity::new(&self.settings);
-        self.figures = drawing::figures(&[], &self.settings);
+        self.objects = Objects::new();
         self.last_ms = None;
     }
 
@@ -722,27 +799,56 @@ impl Run {
                 blocked.as_deref(),
                 &|name| gstreamer::ElementFactory::find(name).is_some(),
             ) else {
-                self.fail("No decoder for this video is installed".to_owned());
+                self.fail(
+                    "No decoder for this video is installed".to_owned(),
+                    Cause::Input,
+                );
                 return;
             };
-            self.decoder_note = pick.note;
-            match Decoder::new(format, pick.element, self.settings.analysis_fps) {
+            self.decoder_note = match (self.gave_up, pick.note) {
+                (Some(element), _) => Some(decoding::gave_up_note(element, !pick.hardware)),
+                (None, note) => note,
+            };
+            let gpu = if pick.hardware {
+                scaling::plan(
+                    pick.element,
+                    (format.width, format.height),
+                    TARGET.0,
+                    TARGET.1,
+                    &self.failed_scalers,
+                    &|name| gstreamer::ElementFactory::find(name).is_some(),
+                )
+            } else {
+                None
+            };
+            self.current_hardware = pick.hardware;
+            self.current_scaler = gpu.map(|gpu| gpu.scaler);
+            match Decoder::new(format, pick.element, self.settings.analysis_fps, gpu) {
                 Ok(decoder) => {
-                    tracing::info!(binding = self.binding, decoder = pick.element, "Decoding");
+                    tracing::info!(
+                        binding = self.binding,
+                        decoder = pick.element,
+                        scaler = gpu.map_or("cpu", |gpu| gpu.scaler.element()),
+                        "Decoding"
+                    );
                     self.decoder = Some(decoder);
                     self.current_decoder = Some(pick.element);
                     self.decoder_trial = pick.hardware.then(Instant::now);
+                    self.last_picture = Instant::now();
                     self.base_us = unit.time_us;
                     self.retry_at = None;
                 }
                 Err(error) if pick.hardware => {
                     self.current_decoder = Some(pick.element);
                     self.decoder_trial = Some(Instant::now());
-                    self.fail(format!("Could not start {}: {error}", pick.element));
+                    self.fail(
+                        format!("Could not start {}: {error}", pick.element),
+                        Cause::Decoder,
+                    );
                     return;
                 }
                 Err(error) => {
-                    self.fail(format!("Could not start a decoder: {error}"));
+                    self.fail(format!("Could not start a decoder: {error}"), Cause::Input);
                     return;
                 }
             }
@@ -750,7 +856,20 @@ impl Run {
             .decoder_trial
             .is_some_and(|since| since.elapsed() >= DECODER_TRIAL)
         {
-            self.fail("It gave no pictures".to_owned());
+            self.fail("It gave no pictures".to_owned(), Cause::Decoder);
+            return;
+        } else if self.current_hardware
+            && self.decoder_trial.is_none()
+            && self.last_picture.elapsed() >= DECODER_STALL
+        {
+            // Units keep coming and nothing comes out: with a GPU scaler in
+            // the way, it is the newer part that is blamed first.
+            let cause = if self.current_scaler.is_some() {
+                Cause::Scaler
+            } else {
+                Cause::Decoder
+            };
+            self.fail("It stopped giving pictures".to_owned(), cause);
             return;
         }
         self.waiting_keyframe = false;
@@ -759,14 +878,27 @@ impl Run {
             .as_ref()
             .map(|decoder| decoder.push(unit, self.base_us));
         if let Some(Err(error)) = pushed {
-            self.fail(error.to_string());
+            // The pipeline is gone: its own failure.
+            self.fail(error.to_string(), Cause::Decoder);
         }
     }
 
-    fn fail(&mut self, detail: String) {
-        // A hardware decoder that never gave a picture will not start now: on
-        // to the next one at once. One that was working gets the usual retry.
+    /// `cause`: whose fault it was, as far as is known.
+    fn fail(&mut self, detail: String, cause: Cause) {
+        // Nothing yet from a hardware decoder on trial: it will not start now.
+        // With a GPU scaler in the pipeline the scaler is blamed first: the
+        // same decoder carries on with CPU scaling. Only without one (or when
+        // that fails too) the decoder is given up, and the next one takes over.
         if self.decoder_trial.take().is_some() {
+            if let Some(scaler) = self.current_scaler.take() {
+                tracing::warn!(binding = self.binding, scaler = scaler.element(), %detail, "GPU scaler failed; scaling on the CPU");
+                self.failed_scalers.push(scaler);
+                self.scaler_note = Some(scaling::given_up_note(scaler, false));
+                self.decoder = None;
+                self.current_decoder = None;
+                self.waiting_keyframe = true;
+                return;
+            }
             if let Some(element) = self.current_decoder.take() {
                 tracing::warn!(binding = self.binding, decoder = element, %detail, "Decoder failed; trying the next");
                 self.failed_decoders.push(element);
@@ -774,6 +906,10 @@ impl Run {
                 self.waiting_keyframe = true;
                 return;
             }
+        }
+        // One that was working gets the usual retry, until it keeps failing.
+        if self.give_up_running(&detail, cause) {
+            return;
         }
         tracing::warn!(binding = self.binding, %detail, "Object detection failed; retrying");
         self.decoder = None;
@@ -784,12 +920,54 @@ impl Run {
         self.reset_detection();
     }
 
+    /// A failure of a decoder or GPU scaler that had produced pictures: its
+    /// second within [`decoding::RUNNING_WINDOW`] gives it up and the next
+    /// takes over at once. True when it did.
+    fn give_up_running(&mut self, detail: &str, cause: Cause) -> bool {
+        enum Culprit {
+            Scaler(Scaler),
+            Decoder(&'static str),
+        }
+        let culprit = match (cause, self.current_scaler, self.current_decoder) {
+            (Cause::Scaler, Some(scaler), _) => Culprit::Scaler(scaler),
+            (Cause::Decoder, _, Some(element)) if self.current_hardware => {
+                Culprit::Decoder(element)
+            }
+            _ => return false,
+        };
+        let key = match culprit {
+            Culprit::Scaler(scaler) => scaler.element(),
+            Culprit::Decoder(element) => element,
+        };
+        if !self.running_failures.note(key, Instant::now()) {
+            return false;
+        }
+        match culprit {
+            Culprit::Scaler(scaler) => {
+                tracing::warn!(binding = self.binding, scaler = key, %detail, "GPU scaler kept failing while running; scaling on the CPU");
+                self.failed_scalers.push(scaler);
+                self.scaler_note = Some(scaling::given_up_note(scaler, true));
+            }
+            Culprit::Decoder(element) => {
+                tracing::warn!(binding = self.binding, decoder = key, %detail, "Decoder kept failing while running; trying the next");
+                self.failed_decoders.push(element);
+                self.gave_up = Some(element);
+            }
+        }
+        self.decoder = None;
+        self.current_decoder = None;
+        self.current_scaler = None;
+        self.waiting_keyframe = true;
+        self.reset_detection();
+        true
+    }
+
     fn pictures(&mut self) {
         let Some(decoder) = self.decoder.as_ref() else {
             return;
         };
-        if let Some(problem) = decoder.failed() {
-            self.fail(problem);
+        if let Some((problem, cause)) = decoder.failed() {
+            self.fail(problem, cause);
             return;
         }
         loop {
@@ -797,7 +975,7 @@ impl Run {
                 Some(Ok(Some(picture))) => picture,
                 Some(Ok(None)) | None => return,
                 Some(Err(error)) => {
-                    self.fail(error.to_string());
+                    self.fail(error.to_string(), Cause::Input);
                     return;
                 }
             };
@@ -808,19 +986,24 @@ impl Run {
     fn picture(&mut self, (pixels, width, height, time_ms, seq): AnalyzedPicture) {
         if self.raw_layout.is_none() {
             self.decoder_trial = None; // it works
+            self.last_picture = Instant::now();
         }
         self.picture_seq = seq;
         self.frames += 1;
         self.measured += 1;
         self.detail = if self.raw_layout.is_none() {
-            self.decoder_note.clone()
+            let notes: Vec<&str> = [&self.decoder_note, &self.scaler_note]
+                .into_iter()
+                .filter_map(|note| note.as_deref())
+                .collect();
+            (!notes.is_empty()).then(|| notes.join("; "))
         } else {
             None
         };
         if self.moving {
             self.state = BindingState::Settling;
-            self.draw(OBJECTS, vec![]);
-            self.draw(ZONES, vec![]);
+            self.clear_layer(OBJECTS);
+            self.clear_layer(ZONES);
             return;
         }
         self.state = BindingState::Running;
@@ -832,27 +1015,41 @@ impl Run {
             self.reset_detection();
         }
         self.last_ms = Some(now_ms);
-        let min_score = f32::from(self.settings.confidence) / 100.0;
-        match self.model.detect(&pixels, width, height, min_score) {
+        let thresholds = self.settings.thresholds(&self.model.classes);
+        let found = self
+            .model
+            .detect_classes(&pixels, width, height, &thresholds);
+        self.detected(now_ms, found);
+    }
+
+    /// What the model found on the analysed picture (`picture_seq`): its
+    /// events and its drawings, from that picture's objects only.
+    fn detected(&mut self, now_ms: i64, found: anyhow::Result<Vec<detector::Detection>>) {
+        match found {
             Ok(found) => {
                 let kept = detector::keep(found, &self.settings);
-                let actions = self.activity.observe(&kept, &self.settings, now_ms);
+                self.objects.observe(&kept, &self.settings, now_ms);
+                let present = self.objects.presence(&self.settings, now_ms);
+                let actions = self.activity.observe(&present, now_ms);
                 self.emit(actions);
-                self.figures = drawing::figures(&kept, &self.settings);
-                self.draw(OBJECTS, drawing::objects(&kept));
+                let drawn = drawing::objects(&self.objects, &self.settings, now_ms);
+                self.draw(OBJECTS, drawn);
                 self.draw(ZONES, drawing::zones(&self.settings));
             }
             Err(error) => tracing::debug!(binding = self.binding, %error, "Picture skipped"),
         }
     }
 
-    /// Send what `layer` shows now; an empty layer is sent once, to clear it.
+    /// Send what `layer` shows for the analysed picture (`picture_seq`): every
+    /// picture, with `items: []` when there is nothing to draw, so viewers can
+    /// follow this plugin's picture clock. Without a picture identity an empty
+    /// layer would only mean "clear", so it is sent once, while something shows.
     fn draw(&mut self, layer: &str, items: Vec<OverlayItem>) {
         let slot = usize::from(layer == ZONES);
-        if items.is_empty() && !self.drawn[slot] {
+        if items.is_empty() && self.picture_seq.is_none() && !self.drawn[slot] {
             return;
         }
-        self.drawn[slot] = !items.is_empty();
+        self.drawn[slot] = !items.is_empty() || self.picture_seq.is_some();
         self.out.send(Message::notification(
             method::OVERLAY,
             Overlay {
@@ -860,6 +1057,26 @@ impl Run {
                 layer: layer.into(),
                 items,
                 seq: self.picture_seq,
+                ttl_ms: Some(drawing_ttl_ms(self.settings.analysis_fps)),
+            },
+        ));
+    }
+
+    /// Clear `layer` (a run resets): an empty overlay without a picture, sent
+    /// once, while the layer shows anything.
+    fn clear_layer(&mut self, layer: &str) {
+        let slot = usize::from(layer == ZONES);
+        if !self.drawn[slot] {
+            return;
+        }
+        self.drawn[slot] = false;
+        self.out.send(Message::notification(
+            method::OVERLAY,
+            Overlay {
+                binding: self.binding,
+                layer: layer.into(),
+                items: vec![],
+                seq: None,
                 ttl_ms: Some(drawing_ttl_ms(self.settings.analysis_fps)),
             },
         ));
@@ -873,42 +1090,49 @@ impl Run {
     fn emit(&mut self, actions: Vec<Action>) {
         for action in actions {
             let message = match action {
-                Action::Start { kind, score } => {
+                Action::Start {
+                    event: local,
+                    kind,
+                    score,
+                    alert,
+                } => {
                     let event = self.events.fetch_add(1, Ordering::Relaxed) + 1;
-                    self.event[kind.index()] = Some(event);
-                    Message::notification(
-                        method::EVENT_START,
-                        EventStart {
-                            binding: self.binding,
-                            event,
-                            kind: kind.id().into(),
-                            score: Some(score),
-                            seq: self.picture_seq,
-                        },
-                    )
+                    self.event.insert(local, event);
+                    // `alert` is newer than the bundled SDK copy's `EventStart`:
+                    // the same fields as JSON, so it builds against either.
+                    let mut params = serde_json::json!({
+                        "binding": self.binding, "event": event, "kind": kind,
+                        "score": score, "alert": alert,
+                    });
+                    if let Some(seq) = self.picture_seq {
+                        params["seq"] = seq.into();
+                    }
+                    Message::notification(method::EVENT_START, params)
                 }
                 Action::Update {
-                    kind,
+                    event: local,
                     peak,
                     bbox,
                     zones,
+                    alert,
                 } => {
-                    let Some(event) = self.event[kind.index()] else {
+                    let Some(event) = self.event.get(&local).copied() else {
                         continue;
                     };
-                    Message::notification(
-                        method::EVENT_UPDATE,
-                        EventUpdate {
-                            binding: self.binding,
-                            event,
-                            score: Some(peak),
-                            bbox,
-                            zones,
-                        },
-                    )
+                    // As `EventUpdate`, with `alert` (see the start above).
+                    let mut params = serde_json::json!({
+                        "binding": self.binding, "event": event, "score": peak, "alert": alert,
+                    });
+                    if let Some(bbox) = bbox {
+                        params["bbox"] = serde_json::json!(bbox);
+                    }
+                    if !zones.is_empty() {
+                        params["zones"] = serde_json::json!(zones);
+                    }
+                    Message::notification(method::EVENT_UPDATE, params)
                 }
-                Action::End { kind } => {
-                    let Some(event) = self.event[kind.index()].take() else {
+                Action::End { event: local } => {
+                    let Some(event) = self.event.remove(&local) else {
                         continue;
                     };
                     Message::notification(
@@ -939,12 +1163,20 @@ impl Run {
             self.state = BindingState::Waiting;
         }
         let decoder = if self.raw_layout.is_some() {
-            Some("NeuroWatch's pictures (no decoding here)".into())
+            Some(scaling::status_line(
+                "NeuroWatch's pictures (no decoding here)",
+                false,
+            ))
         } else {
             self.decoder
                 .as_ref()
                 .and_then(|d| d.name.lock().ok().and_then(|name| name.clone()))
-                .map(|name| decoding::status_text(&name, self.decoder_note.as_deref()))
+                .map(|name| {
+                    scaling::status_line(
+                        &decoding::status_text(&name, self.decoder_note.as_deref()),
+                        self.current_scaler.is_some(),
+                    )
+                })
         };
         let status = Status {
             bindings: vec![BindingStatus {
@@ -954,7 +1186,7 @@ impl Run {
                 fps: self.fps,
                 frames: self.frames,
                 decoder,
-                figures: self.figures.clone(),
+                figures: vec![],
             }],
         };
         self.out.send(Message::notification(method::STATUS, status));
@@ -1057,5 +1289,530 @@ mod timeline_tests {
         limit.admit(u64::MAX - 1);
         limit.admit(u64::MAX);
         limit.admit(0);
+    }
+}
+
+#[cfg(test)]
+mod pipeline_tests {
+    use super::*;
+
+    use nw_analytics_protocol::frame::{flags, MediaKind};
+
+    fn ready() -> bool {
+        gstreamer::init().is_ok()
+            && gstreamer::ElementFactory::find("x264enc").is_some()
+            && gstreamer::ElementFactory::find("avdec_h264").is_some()
+    }
+
+    /// A real 1280×720 H.264 clip, as the units NeuroWatch would send.
+    fn clip() -> Vec<MediaUnit> {
+        let pipeline = gstreamer::parse::launch(
+            "videotestsrc num-buffers=60 ! video/x-raw,format=I420,width=1280,height=720,framerate=25/1 \
+             ! x264enc tune=zerolatency key-int-max=10 bframes=0 \
+             ! video/x-h264,profile=main ! h264parse ! video/x-h264,stream-format=byte-stream,alignment=au \
+             ! appsink name=out sync=false",
+        )
+        .unwrap()
+        .downcast::<gstreamer::Pipeline>()
+        .unwrap();
+        let sink = pipeline
+            .by_name("out")
+            .unwrap()
+            .downcast::<gstreamer_app::AppSink>()
+            .unwrap();
+        pipeline.set_state(gstreamer::State::Playing).unwrap();
+        let mut units = vec![];
+        while let Ok(sample) = sink.pull_sample() {
+            let buffer = sample.buffer().unwrap();
+            let map = buffer.map_readable().unwrap();
+            units.push(MediaUnit {
+                media: MediaKind::Video,
+                flags: if buffer.flags().contains(gstreamer::BufferFlags::DELTA_UNIT) {
+                    0
+                } else {
+                    flags::KEYFRAME
+                },
+                binding: 1,
+                seq: units.len() as u64,
+                time_us: 1_000_000 + units.len() as i64 * 40_000,
+                pts_ns: buffer.pts().map(|pts| pts.nseconds()),
+                dts_ns: buffer.dts().map(|dts| dts.nseconds()),
+                data: map.as_slice().to_vec(),
+            });
+        }
+        let _ = pipeline.set_state(gstreamer::State::Null);
+        units
+    }
+
+    fn format() -> StreamFormat {
+        StreamFormat {
+            binding: 1,
+            codec: Codec::H264,
+            width: 1280,
+            height: 720,
+        }
+    }
+
+    /// Decode the clip on `element`; the first analysed picture.
+    fn first_picture(element: &str, gpu: Option<GpuScale>) -> anyhow::Result<AnalyzedPicture> {
+        let decoder = Decoder::new(&format(), element, 5, gpu)?;
+        let units = clip();
+        assert!(units.len() > 10, "the clip has pictures");
+        for unit in &units {
+            decoder.push(unit, 1_000_000)?;
+        }
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(10) {
+            if let Some((problem, _)) = decoder.failed() {
+                anyhow::bail!(problem);
+            }
+            if let Some(picture) = decoder.pull()? {
+                return Ok(picture);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        anyhow::bail!("no picture")
+    }
+
+    #[test]
+    fn errors_are_blamed_on_what_posted_them() {
+        for (path, cause) in [
+            ("/GstPipeline:pipeline0/GstVaPostProc:scale", Cause::Scaler),
+            (
+                "/GstPipeline:pipeline0/GstVaPostProc:scale:src",
+                Cause::Scaler,
+            ),
+            (
+                "/GstPipeline:pipeline0/GstCudaDownload:download",
+                Cause::Scaler,
+            ),
+            ("/GstPipeline:pipeline0/GstVaH264Dec:decode", Cause::Decoder),
+            (
+                "/GstPipeline:pipeline0/GstVaH264Dec:decode:sink",
+                Cause::Decoder,
+            ),
+            (
+                "/GstPipeline:pipeline0/GstH264Parse:h264parse0",
+                Cause::Input,
+            ),
+            ("/GstPipeline:pipeline0/GstAppSrc:src", Cause::Input),
+            (
+                "/GstPipeline:pipeline0/GstVideoConvert:videoconvert0",
+                Cause::Input,
+            ),
+        ] {
+            assert_eq!(Cause::of_source(path), cause, "{path}");
+        }
+    }
+
+    #[test]
+    fn the_cpu_decodes_and_scales_a_real_clip() {
+        if !ready() {
+            eprintln!("skipped: x264enc/avdec_h264 not available");
+            return;
+        }
+        let (pixels, width, height, _, _) = first_picture("avdec_h264", None).unwrap();
+        let _ = &pixels;
+        assert_eq!((width, height), (ANALYSIS_WIDTH, 234));
+    }
+
+    #[test]
+    fn a_missing_scaler_means_cpu_scaling_on_the_same_decoder() {
+        if !ready() {
+            eprintln!("skipped: x264enc/avdec_h264 not available");
+            return;
+        }
+        let installed = |name: &str| gstreamer::ElementFactory::find(name).is_some();
+        // The decoder of this machine, if it has a hardware one with no scaler here.
+        for decoder in ["vah264dec", "nvh264dec", "d3d11h264dec", "d3d12h264dec"] {
+            if !installed(decoder) {
+                continue;
+            }
+            let gpu = scaling::plan(decoder, (1280, 720), TARGET.0, TARGET.1, &[], &installed);
+            match gpu {
+                Some(gpu) => {
+                    eprintln!(
+                        "{decoder}: scaler {} is here (not exercised)",
+                        gpu.scaler.element()
+                    );
+                }
+                None => {
+                    eprintln!("{decoder}: no GPU scaler here, scaling on the CPU");
+                    let (pixels, width, height, _, _) = first_picture(decoder, None).unwrap();
+                    let _ = &pixels;
+                    assert_eq!((width, height), (ANALYSIS_WIDTH, 234));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_scaler_that_cannot_be_built_is_an_error_not_a_hang() {
+        if !ready() {
+            return;
+        }
+        // A scaler the registry lacks: the pipeline does not build.
+        if gstreamer::ElementFactory::find("vapostproc").is_none() {
+            let gpu = GpuScale {
+                scaler: Scaler::Va,
+                width: 416,
+                height: 234,
+            };
+            assert!(Decoder::new(&format(), "avdec_h264", 5, Some(gpu)).is_err());
+        }
+    }
+
+    #[test]
+    fn the_scalers_pipeline_text_parses_where_its_elements_exist() {
+        if gstreamer::init().is_err() {
+            return;
+        }
+        for scaler in Scaler::ALL {
+            let installed = |name: &str| gstreamer::ElementFactory::find(name).is_some();
+            if scaling::scaler_for(
+                match scaler {
+                    Scaler::Va => "vah264dec",
+                    Scaler::Cuda => "nvh264dec",
+                    Scaler::D3d11 => "d3d11h264dec",
+                    Scaler::D3d12 => "d3d12h264dec",
+                },
+                &[],
+                &installed,
+            )
+            .is_none()
+            {
+                eprintln!("{} is not installed here: not parsed", scaler.element());
+                continue;
+            }
+            let text = format!("fakesrc ! {} ! fakesink", scaler.segment(320, 180));
+            gstreamer::parse::launch(&text).unwrap_or_else(|error| panic!("{text}: {error}"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
+
+    struct Quiet;
+    impl Sender for Quiet {
+        fn send(&self, _: Message) {}
+    }
+
+    fn run() -> Run {
+        Run::new(
+            1,
+            DetectSettings::default(),
+            detector::shared().unwrap(),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(Quiet),
+        )
+    }
+
+    /// A hardware decoder, with a GPU scaler or not, as `unit` leaves it.
+    fn started(run: &mut Run, scaler: Option<Scaler>, trial: bool) {
+        run.current_decoder = Some("vah264dec");
+        run.current_hardware = true;
+        run.current_scaler = scaler;
+        run.decoder_trial = trial.then(Instant::now);
+    }
+
+    struct Recorded(std::sync::Mutex<Vec<(String, Option<u64>, usize)>>);
+    impl Sender for Recorded {
+        fn send(&self, message: Message) {
+            if let Message::Notification { params, .. } = message {
+                if let Ok(mut all) = self.0.lock() {
+                    all.push((
+                        params["layer"].as_str().unwrap_or_default().to_owned(),
+                        params["seq"].as_u64(),
+                        params["items"].as_array().map_or(0, Vec::len),
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_analysed_picture_sends_its_layer_even_when_empty() {
+        let sent = Arc::new(Recorded(Default::default()));
+        let mut run = Run::new(
+            1,
+            DetectSettings::default(),
+            detector::shared().unwrap(),
+            Arc::new(AtomicU64::new(0)),
+            sent.clone(),
+        );
+        let layer = OBJECTS;
+        let log = || sent.0.lock().unwrap().clone();
+        run.picture_seq = Some(4);
+        run.draw(layer, vec![]);
+        run.picture_seq = Some(5);
+        run.draw(layer, vec![]);
+        assert_eq!(
+            log(),
+            vec![
+                (layer.to_owned(), Some(4), 0),
+                (layer.to_owned(), Some(5), 0)
+            ],
+            "an empty result for each picture, not suppressed"
+        );
+        run.clear_layer(layer);
+        assert_eq!(
+            log()[2],
+            (layer.to_owned(), None, 0),
+            "a reset clears, without a picture"
+        );
+        run.clear_layer(layer);
+        assert_eq!(log().len(), 3, "cleared once");
+        // Without a picture identity an empty layer is only a clear: not repeated.
+        run.picture_seq = None;
+        run.draw(layer, vec![]);
+        assert_eq!(log().len(), 3);
+    }
+
+    /// Every box drawn, with its layer and picture.
+    type Drawn = Vec<(String, Option<u64>, Vec<[f32; 4]>)>;
+    struct Boxes(std::sync::Mutex<Drawn>);
+    impl Sender for Boxes {
+        fn send(&self, message: Message) {
+            if let Message::Notification { params, .. } = message {
+                let Some(layer) = params["layer"].as_str() else {
+                    return; // an event, not a drawing
+                };
+                let boxes = params["items"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|item| item["type"] == "box")
+                    .filter_map(|item| {
+                        serde_json::from_value::<[f32; 4]>(item["rect"].clone()).ok()
+                    })
+                    .collect();
+                if let Ok(mut all) = self.0.lock() {
+                    all.push((layer.to_owned(), params["seq"].as_u64(), boxes));
+                }
+            }
+        }
+    }
+
+    fn overlaps(a: [f32; 4], b: [f32; 4]) -> bool {
+        a[0] < b[0] + b[2] && b[0] < a[0] + a[2] && a[1] < b[1] + b[3] && b[1] < a[1] + a[3]
+    }
+
+    /// The contract every plugin keeps (each tests
+    /// it): after a restart (its picture source switching, as the video wall
+    /// going between a grid and one camera does) every box drawn for a picture
+    /// sits on something in that picture. Detect draws each picture's own
+    /// objects; this keeps it so if it ever holds or smooths boxes (Motion's
+    /// learned background drew where an object had been, 2026-11-23).
+    #[test]
+    fn after_a_restart_every_box_is_on_something_in_its_picture() {
+        let sent = Arc::new(Boxes(Default::default()));
+        let settings = DetectSettings {
+            classes: vec![crate::settings::ClassChoice::new("person", 50)],
+            ..DetectSettings::default()
+        };
+        let mut run = Run::new(
+            1,
+            settings,
+            detector::shared().unwrap(),
+            Arc::new(AtomicU64::new(0)),
+            sent.clone(),
+        );
+        let person = |x: f32| {
+            let rect = [x, 0.3, 0.1, 0.4];
+            let detection = detector::Detection {
+                class: 0,
+                id: "person".into(),
+                label: "Person".into(),
+                score: 0.9,
+                rect,
+            };
+            (rect, vec![detection])
+        };
+        let mut at = 0;
+        for step in 0..8 {
+            run.picture_seq = Some(step);
+            run.detected(at, Ok(person(0.1 + 0.02 * step as f32).1));
+            at += 200;
+        }
+        run.restart();
+        let mut objects = std::collections::HashMap::new();
+        for step in 0..8 {
+            let (rect, found) = person(0.6 + 0.02 * step as f32);
+            let seq = 100 + step;
+            objects.insert(seq, rect);
+            run.picture_seq = Some(seq);
+            run.detected(at, Ok(found));
+            at += 200;
+        }
+        let after: Vec<_> = sent
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, seq, _)| seq.is_some_and(|seq| seq >= 100))
+            .cloned()
+            .collect();
+        assert!(
+            after.iter().any(|(_, _, boxes)| !boxes.is_empty()),
+            "the person was boxed after the restart"
+        );
+        for (layer, seq, boxes) in &after {
+            let object = objects[&seq.unwrap()];
+            for rect in boxes {
+                assert!(
+                    overlaps(*rect, object),
+                    "{layer} box {rect:?} on picture {seq:?}, the person is at {object:?}"
+                );
+            }
+        }
+    }
+
+    /// Every event message sent, as its method and parameters.
+    struct Sent(std::sync::Mutex<Vec<(String, serde_json::Value)>>);
+    impl Sender for Sent {
+        fn send(&self, message: Message) {
+            if let Message::Notification { method, params } = message {
+                if method.starts_with("event.") {
+                    self.0.lock().unwrap().push((method, params));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn events_say_whether_they_are_alerts_and_older_recorders_still_read_them() {
+        let sent = Arc::new(Sent(Default::default()));
+        let settings = DetectSettings {
+            classes: vec![
+                crate::settings::ClassChoice::new("person", 50),
+                crate::settings::ClassChoice::new("dog", 50),
+            ],
+            min_duration_sec: 0.0,
+            ..DetectSettings::default()
+        };
+        let mut run = Run::new(
+            1,
+            settings,
+            detector::shared().unwrap(),
+            Arc::new(AtomicU64::new(0)),
+            sent.clone(),
+        );
+        let seen = |class: usize, id: &str, x: f32| detector::Detection {
+            class,
+            id: id.into(),
+            label: id.into(),
+            score: 0.9,
+            rect: [x, 0.3, 0.1, 0.3],
+        };
+        for (step, at) in [0i64, 500].into_iter().enumerate() {
+            run.picture_seq = Some(step as u64);
+            run.detected(at, Ok(vec![seen(0, "person", 0.1), seen(16, "dog", 0.6)]));
+        }
+        let all = sent.0.lock().unwrap().clone();
+        let starts: Vec<_> = all
+            .iter()
+            .filter(|(m, _)| m == method::EVENT_START)
+            .collect();
+        let alert_of = |kind: &str| {
+            starts
+                .iter()
+                .find(|(_, p)| p["kind"] == kind)
+                .map(|(_, p)| p["alert"].clone())
+        };
+        assert_eq!(alert_of("person"), Some(serde_json::json!(true)), "{all:?}");
+        assert_eq!(
+            alert_of("dog"),
+            Some(serde_json::json!(false)),
+            "a dog is a detection"
+        );
+        for (method, params) in &all {
+            match method.as_str() {
+                method::EVENT_START => {
+                    let parsed: nw_analytics_protocol::messages::EventStart =
+                        serde_json::from_value(params.clone()).unwrap();
+                    assert_eq!(parsed.seq, Some(1));
+                }
+                method::EVENT_UPDATE => {
+                    serde_json::from_value::<nw_analytics_protocol::messages::EventUpdate>(
+                        params.clone(),
+                    )
+                    .unwrap();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn a_scaler_that_gives_no_picture_is_dropped_before_the_decoder() {
+        let mut run = run();
+        started(&mut run, Some(Scaler::Va), true);
+        run.fail("not negotiated".into(), Cause::Decoder);
+        assert_eq!(run.failed_scalers, vec![Scaler::Va]);
+        assert!(run.failed_decoders.is_empty(), "the decoder is not blamed");
+        assert_eq!(run.current_scaler, None);
+        assert_eq!(
+            run.scaler_note.as_deref(),
+            Some("Scaling on the CPU: vapostproc could not scale this video")
+        );
+        assert!(run.retry_at.is_none(), "rebuilt at once, no wait");
+        // The same decoder again, now with CPU scaling; it fails too.
+        started(&mut run, None, true);
+        run.fail("no pictures".into(), Cause::Decoder);
+        assert_eq!(
+            run.failed_decoders,
+            vec!["vah264dec"],
+            "only now the decoder moves on"
+        );
+        assert_eq!(run.failed_scalers, vec![Scaler::Va]);
+    }
+
+    #[test]
+    fn a_running_decoder_is_given_up_on_its_second_failure() {
+        let mut run = run();
+        started(&mut run, None, false);
+        run.fail("hiccup".into(), Cause::Decoder);
+        assert!(run.failed_decoders.is_empty(), "the first is a retry");
+        assert!(run.retry_at.is_some());
+        started(&mut run, None, false);
+        run.fail("again".into(), Cause::Decoder);
+        assert_eq!(run.failed_decoders, vec!["vah264dec"]);
+        assert_eq!(run.gave_up, Some("vah264dec"));
+    }
+
+    #[test]
+    fn input_problems_never_count_against_a_decoder() {
+        let mut run = run();
+        for _ in 0..5 {
+            started(&mut run, Some(Scaler::Va), false);
+            run.fail("a bad picture".into(), Cause::Input);
+        }
+        assert!(run.failed_decoders.is_empty());
+        assert!(run.failed_scalers.is_empty());
+        // A software decoder's failures are never given up, whoever's fault.
+        let mut run = self::run();
+        for _ in 0..5 {
+            run.current_decoder = Some("avdec_h264");
+            run.current_hardware = false;
+            run.fail("broken".into(), Cause::Decoder);
+        }
+        assert!(run.failed_decoders.is_empty());
+    }
+
+    #[test]
+    fn a_running_scaler_that_keeps_failing_is_dropped_not_the_decoder() {
+        let mut run = run();
+        started(&mut run, Some(Scaler::Va), false);
+        run.fail("scale error".into(), Cause::Scaler);
+        started(&mut run, Some(Scaler::Va), false);
+        run.fail("scale error".into(), Cause::Scaler);
+        assert_eq!(run.failed_scalers, vec![Scaler::Va]);
+        assert!(run.failed_decoders.is_empty());
+        assert_eq!(
+            run.scaler_note.as_deref(),
+            Some("Scaling on the CPU: vapostproc kept failing while running")
+        );
     }
 }

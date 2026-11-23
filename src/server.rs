@@ -414,26 +414,30 @@ impl Session {
             method::CONFIGURE => {
                 let configure: Configure = params(values)?;
                 let worker = self.workers.get(&configure.binding).ok_or_else(unknown)?;
-                let settings = settings::validate(&configure.config).map_err(invalid_config)?;
+                let settings =
+                    settings::validate(&configure.config, &crate::detector::shared_classes())
+                        .map_err(invalid_config)?;
                 let accepted = accepted(&settings);
                 worker.offer(Input::Settings(settings));
                 Ok(to_value(accepted))
             }
             method::VALIDATE_CONFIG => {
                 let validate: ValidateConfig = params(values)?;
-                Ok(to_value(match settings::validate(&validate.config) {
-                    Ok(_) => Validation {
-                        ok: true,
-                        errors: vec![],
+                Ok(to_value(
+                    match settings::validate(&validate.config, &crate::detector::shared_classes()) {
+                        Ok(_) => Validation {
+                            ok: true,
+                            errors: vec![],
+                        },
+                        Err(message) => Validation {
+                            ok: false,
+                            errors: vec![ConfigError {
+                                path: String::new(),
+                                message,
+                            }],
+                        },
                     },
-                    Err(message) => Validation {
-                        ok: false,
-                        errors: vec![ConfigError {
-                            path: String::new(),
-                            message,
-                        }],
-                    },
-                }))
+                ))
             }
             method::DETACH => {
                 let detach: Detach = params(values)?;
@@ -482,7 +486,8 @@ impl Session {
                 format!("This detection plugin analyses at most {MAX_BINDINGS} cameras"),
             ));
         }
-        let settings = settings::validate(&attach.config).map_err(invalid_config)?;
+        let settings = settings::validate(&attach.config, &crate::detector::shared_classes())
+            .map_err(invalid_config)?;
         let accepted = accepted(&settings);
         let worker = Worker::start(
             attach.binding,

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 const USAGE: &str = "\
 nw-detect: NeuroWatch object detection plugin
 
-Usage: nw-detect [--listen ADDRESS] [--identity PATH] [--access-codes PATH] [--model PATH]
+Usage: nw-detect [--listen ADDRESS] [--identity PATH] [--access-codes PATH] [--model PATH] [--classes FILE]
        nw-detect access-codes add|limit|remove|list PATH …   (see access-codes --help)
 
   --listen ADDRESS      unix:/path, pipe:\\\\.\\pipe\\NAME, tcp:127.0.0.1:PORT,
@@ -22,7 +22,9 @@ Usage: nw-detect [--listen ADDRESS] [--identity PATH] [--access-codes PATH] [--m
                         (refused otherwise)
   --model PATH          a YOLOX ONNX model with a fixed square input to use
                         instead of the built-in YOLOX-Nano (e.g. YOLOX-Tiny
-                        or YOLOX-S, more accurate and slower)
+                        or YOLOX-S, more accurate and slower); its classes are
+                        read from the same path ending in .json
+  --classes FILE        the model's class file, instead of PATH with .json
   --check               check GStreamer and the model, and time one detection
   --version             print the version
   RUST_LOG              log filter (default: info)";
@@ -51,6 +53,7 @@ fn main() -> anyhow::Result<()> {
     let mut access = None;
     let mut open = false;
     let mut model = None;
+    let mut classes = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -78,6 +81,12 @@ fn main() -> anyhow::Result<()> {
                         .ok_or_else(|| anyhow::anyhow!("--model needs a path"))?,
                 ))
             }
+            "--classes" => {
+                classes = Some(PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--classes needs a path"))?,
+                ))
+            }
             "--hardware-decoding" => eprintln!(
                 "nw-detect: --hardware-decoding is ignored: choose each camera's Video decoder in its settings"
             ),
@@ -89,7 +98,7 @@ fn main() -> anyhow::Result<()> {
                 )
             }
             "--open" => open = true,
-            "--check" => return check(model.as_deref()),
+            "--check" => return check(model.as_deref(), classes.as_deref()),
             "--version" => {
                 println!("nw-detect {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
@@ -115,8 +124,13 @@ fn main() -> anyhow::Result<()> {
     });
     access.watch()?;
     gstreamer::init()?;
-    let loaded = nw_detect::detector::install(model.as_deref())?;
-    tracing::info!(model = %loaded.name, input = loaded.size, "Model loaded");
+    let loaded = nw_detect::detector::install(model.as_deref(), classes.as_deref())?;
+    tracing::info!(
+        model = %loaded.name,
+        classes = loaded.classes.len(),
+        input = loaded.size,
+        "Model loaded"
+    );
     if let Some(parent) = parent {
         watch_parent(parent)?;
     }
@@ -163,7 +177,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 /// `--check`: the GStreamer in use and whether it can run the analysis.
-fn check(model: Option<&Path>) -> anyhow::Result<()> {
+fn check(model: Option<&Path>, classes: Option<&Path>) -> anyhow::Result<()> {
     use_bundled_gstreamer();
     gstreamer::init()?;
     println!("nw-detect {}", env!("CARGO_PKG_VERSION"));
@@ -185,7 +199,16 @@ fn check(model: Option<&Path>) -> anyhow::Result<()> {
     if let Some(reason) = nw_detect::worker::va_blocked() {
         println!("VA-API not used: {reason}");
     }
-    let loaded = nw_detect::detector::install(model)?;
+    let scalers = nw_detect::worker::gpu_scalers();
+    println!(
+        "GPU scalers (optional): {}",
+        if scalers.is_empty() {
+            "none (the CPU scales)".to_owned()
+        } else {
+            scalers.join(", ")
+        }
+    );
+    let loaded = nw_detect::detector::install(model, classes)?;
     let grey = vec![114u8; nw_detect::worker::ANALYSIS_WIDTH * 234 * 3];
     let started = std::time::Instant::now();
     loaded.detect(&grey, nw_detect::worker::ANALYSIS_WIDTH, 234, 0.5)?;
@@ -195,6 +218,11 @@ fn check(model: Option<&Path>) -> anyhow::Result<()> {
         started.elapsed().as_millis(),
     );
     println!("Model file: {}", loaded.name);
+    println!(
+        "Classes: {} ({} classes)",
+        loaded.classes.name,
+        loaded.classes.len()
+    );
     Ok(())
 }
 

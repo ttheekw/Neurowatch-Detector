@@ -20,6 +20,8 @@ struct Node {
 
 impl Node {
     fn connect() -> Self {
+        // The daemon loads its model at start, before any recorder connects.
+        nw_detect::detector::shared().unwrap();
         let (node, plugin) = UnixStream::pair().unwrap();
         let reader = plugin.try_clone().unwrap();
         std::thread::spawn(move || server::serve(reader, plugin, Options::default()));
@@ -214,12 +216,14 @@ fn hello(node: &mut Node) -> Value {
 }
 
 #[test]
-fn a_camera_is_analysed_and_counted_with_nothing_reported_in_an_empty_scene() {
+fn a_camera_is_analysed_with_nothing_reported_in_an_empty_scene() {
     let units = ball_units(150);
     let mut node = Node::connect();
     let manifest = hello(&mut node);
     assert_eq!(manifest["id"], "nw.detect");
     assert_eq!(manifest["event_kinds"][0]["id"], "person");
+    assert_eq!(manifest["event_kinds"].as_array().map(Vec::len), Some(80));
+    assert!(manifest["config_schema"]["properties"]["classes"].is_object());
 
     // The CPU, named: what the status reports is then known.
     let config = json!({"min_duration_sec": 0.0, "cooldown_sec": 1.0, "decoder": "software"});
@@ -240,14 +244,11 @@ fn a_camera_is_analysed_and_counted_with_nothing_reported_in_an_empty_scene() {
         .find(|(m, p)| m == method::STATUS && counted(p))
         .map(|(_, p)| p["bindings"][0].clone())
         .expect("the camera was analysed");
-    assert_eq!(status["decoder"], "CPU (software)");
-    let figures: Vec<(&str, &str)> = status["figures"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|f| (f["label"].as_str().unwrap(), f["value"].as_str().unwrap()))
-        .collect();
-    assert_eq!(figures, vec![("People", "0"), ("Vehicles", "0")]);
+    assert_eq!(status["decoder"], "CPU (software) · scaled down on the CPU");
+    assert!(
+        status["figures"].as_array().is_none_or(Vec::is_empty),
+        "no counts are shown"
+    );
     assert!(
         !seen.iter().any(|(m, _)| m == method::EVENT_START),
         "a test pattern holds nobody"
@@ -258,7 +259,7 @@ fn a_camera_is_analysed_and_counted_with_nothing_reported_in_an_empty_scene() {
 
 /// A real picture of a person, if the run provides one
 /// (`NW_DETECT_TEST_PICTURE=/path/to/person.jpg`): reported as a person,
-/// boxed, counted, and ended when unbound.
+/// boxed, and ended when unbound.
 #[test]
 fn a_person_in_the_picture_is_reported_boxed_and_ended() {
     let Ok(path) = std::env::var("NW_DETECT_TEST_PICTURE") else {
@@ -292,7 +293,7 @@ fn a_person_in_the_picture_is_reported_boxed_and_ended() {
         .find(|(m, p)| m == method::OVERLAY && boxed(p))
         .map(|(_, p)| p["items"][0]["label"].as_str().unwrap_or("").to_owned())
         .expect("the person was boxed");
-    assert!(label.starts_with("person "), "{label}");
+    assert!(label.starts_with("Person "), "{label}");
     let (_, during) = node.call(method::DETACH, json!({"binding": 6, "reason": "test"}));
     seen.extend(during);
     let numbers = |name: &str| -> Vec<Value> {
@@ -419,7 +420,7 @@ fn requests_are_checked() {
 
     let (bad, _) = node.call(
         method::ATTACH,
-        json!({"binding": 1, "camera": {"id": "c", "name": "C"}, "config": {"confidence": 0}}),
+        json!({"binding": 1, "camera": {"id": "c", "name": "C"}, "config": {"classes": [{"id": "person", "confidence": 0}]}}),
     );
     assert_eq!(bad.unwrap_err(), error_code::INVALID_CONFIG);
     let (validation, _) = node.call(
@@ -532,7 +533,8 @@ fn local_desktop_pictures_prove_locality_and_keep_capture_identity() {
     assert!(detached.is_ok());
     assert!(
         notices.iter().any(|(m, p)| m == method::STATUS
-            && p["bindings"][0]["decoder"] == "NeuroWatch's pictures (no decoding here)"
+            && p["bindings"][0]["decoder"]
+                == "NeuroWatch's pictures (no decoding here) · scaled down on the CPU"
             && p["bindings"][0]["frames"].as_u64().unwrap_or(0) > 0),
         "shared raw pictures must be analysed: {notices:?}"
     );
@@ -631,6 +633,9 @@ impl Drop for Codes {
 /// Connect over a real Unix socket (so the daemon can close it), the way
 /// `listen` serves one.
 fn connect(access: &std::sync::Arc<nw_detect::access::Access>, silence: Duration) -> UnixStream {
+    // The daemon loads its model at start; a slow first load must not count
+    // as a recorder's silence.
+    nw_detect::detector::shared().unwrap();
     let (node, plugin) = UnixStream::pair().unwrap();
     let access = std::sync::Arc::clone(access);
     let options = Options {
